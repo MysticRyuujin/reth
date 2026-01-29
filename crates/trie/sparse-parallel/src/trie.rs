@@ -123,6 +123,9 @@ pub struct ParallelSparseTrie {
     update_actions_buffers: Vec<Vec<SparseTrieUpdatesAction>>,
     /// Thresholds controlling when parallelism is enabled for different operations.
     parallelism_thresholds: ParallelismThresholds,
+    /// Tracks heat of lower subtries for smart pruning decisions.
+    /// Hot subtries are skipped during pruning to keep frequently-used data revealed.
+    subtrie_heat: SubtrieHeat,
     /// Metrics for the parallel sparse trie.
     #[cfg(feature = "metrics")]
     metrics: crate::metrics::ParallelSparseTrieMetrics,
@@ -141,6 +144,7 @@ impl Default for ParallelSparseTrie {
             branch_node_masks: BranchNodeMasksMap::default(),
             update_actions_buffers: Vec::default(),
             parallelism_thresholds: Default::default(),
+            subtrie_heat: SubtrieHeat::default(),
             #[cfg(feature = "metrics")]
             metrics: Default::default(),
         }
@@ -906,6 +910,7 @@ impl SparseTrie for ParallelSparseTrie {
         self.lower_subtries = [const { LowerSparseSubtrie::Blind(None) }; NUM_LOWER_SUBTRIES];
         self.prefix_set = PrefixSetMut::all();
         self.updates = self.updates.is_some().then(SparseTrieUpdates::wiped);
+        self.subtrie_heat.clear();
     }
 
     fn clear(&mut self) {
@@ -917,6 +922,7 @@ impl SparseTrie for ParallelSparseTrie {
         self.prefix_set.clear();
         self.updates = None;
         self.branch_node_masks.clear();
+        self.subtrie_heat.clear();
         // `update_actions_buffers` doesn't need to be cleared; we want to reuse the Vecs it has
         // buffered, and all of those are already inherently cleared when they get used.
     }
@@ -1036,6 +1042,9 @@ impl SparseTrieExt for ParallelSparseTrie {
     }
 
     fn prune(&mut self, max_depth: usize) -> usize {
+        // Decay heat for subtries not modified this cycle
+        self.subtrie_heat.decay_and_reset();
+
         // DFS traversal to find nodes at max_depth that can be pruned.
         // Collects "effective pruned roots" - children of nodes at max_depth with computed hashes.
         // We replace nodes with Hash stubs inline during traversal.
@@ -1045,6 +1054,15 @@ impl SparseTrieExt for ParallelSparseTrie {
 
         // DFS traversal: pop path and depth, skip if subtrie or node not found.
         while let Some((path, depth)) = stack.pop() {
+            // Skip traversal into hot lower subtries at or beyond max_depth.
+            // This keeps frequently-modified subtries revealed to avoid expensive re-reveals.
+            if depth >= max_depth &&
+                let SparseSubtrieType::Lower(idx) = SparseSubtrieType::from_path(&path) &&
+                self.subtrie_heat.is_hot(idx)
+            {
+                continue;
+            }
+
             // Get children to visit from current node (immutable access)
             let children: SmallVec<[Nibbles; 16]> = {
                 let Some(subtrie) = self.subtrie_for_path(&path) else { continue };
@@ -1365,6 +1383,7 @@ impl ParallelSparseTrie {
             SparseSubtrieType::Upper => None,
             SparseSubtrieType::Lower(idx) => {
                 self.lower_subtries[idx].reveal(path);
+                self.subtrie_heat.mark_modified(idx);
                 Some(self.lower_subtries[idx].as_revealed_mut().expect("just revealed"))
             }
         }
@@ -2037,6 +2056,88 @@ impl ParallelSparseTrie {
 
             self.lower_subtries[index] = LowerSparseSubtrie::Revealed(subtrie);
         }
+    }
+}
+
+/// Bitset tracking which of the 256 lower subtries were modified in the current cycle.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct HotSubtries([u64; 4]);
+
+impl HotSubtries {
+    /// Marks a subtrie index as modified.
+    #[inline]
+    fn set(&mut self, idx: usize) {
+        debug_assert!(idx < NUM_LOWER_SUBTRIES);
+        self.0[idx >> 6] |= 1 << (idx & 63);
+    }
+
+    /// Returns whether a subtrie index is marked as modified.
+    #[inline]
+    fn get(&self, idx: usize) -> bool {
+        debug_assert!(idx < NUM_LOWER_SUBTRIES);
+        (self.0[idx >> 6] & (1 << (idx & 63))) != 0
+    }
+
+    /// Clears all modification flags.
+    #[inline]
+    const fn clear(&mut self) {
+        self.0 = [0; 4];
+    }
+}
+
+/// Tracks heat (modification frequency) for each of the 256 lower subtries.
+///
+/// Heat is used to avoid pruning frequently-modified subtries, which would cause
+/// expensive re-reveal operations on subsequent updates.
+///
+/// - Heat is incremented by 2 when a subtrie is modified
+/// - Heat decays by 1 each prune cycle for subtries not modified that cycle
+/// - Subtries with heat > 0 are considered "hot" and skipped during pruning
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct SubtrieHeat {
+    /// Heat level (0-255) for each of the 256 lower subtries.
+    heat: [u8; NUM_LOWER_SUBTRIES],
+    /// Tracks which subtries were modified in the current cycle.
+    hot: HotSubtries,
+}
+
+impl Default for SubtrieHeat {
+    fn default() -> Self {
+        Self { heat: [0; NUM_LOWER_SUBTRIES], hot: HotSubtries::default() }
+    }
+}
+
+impl SubtrieHeat {
+    /// Marks a subtrie as modified, incrementing its heat by 2.
+    #[inline]
+    fn mark_modified(&mut self, idx: usize) {
+        debug_assert!(idx < NUM_LOWER_SUBTRIES);
+        self.hot.set(idx);
+        self.heat[idx] = self.heat[idx].saturating_add(2);
+    }
+
+    /// Returns whether a subtrie is currently hot (heat > 0).
+    #[inline]
+    fn is_hot(&self, idx: usize) -> bool {
+        debug_assert!(idx < NUM_LOWER_SUBTRIES);
+        self.heat[idx] > 0
+    }
+
+    /// Decays heat for subtries not modified this cycle and resets modification tracking.
+    /// Called at the start of each prune cycle.
+    fn decay_and_reset(&mut self) {
+        for (idx, heat) in self.heat.iter_mut().enumerate() {
+            if !self.hot.get(idx) {
+                *heat = heat.saturating_sub(1);
+            }
+        }
+        self.hot.clear();
+    }
+
+    /// Clears all heat tracking state.
+    const fn clear(&mut self) {
+        self.heat = [0; NUM_LOWER_SUBTRIES];
+        self.hot.clear();
     }
 }
 
@@ -7750,7 +7851,12 @@ mod tests {
             let root_before = trie.root();
             let nodes_before = trie.revealed_node_count();
 
-            trie.prune(max_depth);
+            // Prune multiple times to allow heat to fully decay.
+            // Heat starts at 2 and decays by 1 each cycle for unmodified subtries,
+            // so we need 3 prune cycles: 2→1, 1→0, then actual prune.
+            for _ in 0..3 {
+                trie.prune(max_depth);
+            }
 
             let root_after = trie.root();
             assert_eq!(root_before, root_after, "root hash should be preserved after prune");
@@ -7850,7 +7956,12 @@ mod tests {
             .unwrap();
 
         let root_before = trie.root();
-        trie.prune(1);
+        // Prune multiple times to allow heat to fully decay.
+        // Heat starts at 2 and decays by 1 each cycle for unmodified subtries,
+        // so we need 3 prune cycles: 2→1, 1→0, then actual prune.
+        for _ in 0..3 {
+            trie.prune(1);
+        }
 
         assert_eq!(root_before, trie.root(), "root hash should be preserved");
         assert_eq!(trie.revealed_node_count(), 2, "should have root + extension after prune(1)");
@@ -7916,9 +8027,15 @@ mod tests {
         }
 
         let root_before = trie.root();
-        let pruned = trie.prune(1);
 
-        assert!(pruned > 0, "should have pruned some nodes");
+        // Prune multiple times to allow heat to fully decay.
+        // Heat starts at 2 and decays by 1 each cycle for unmodified subtries.
+        let mut total_pruned = 0;
+        for _ in 0..3 {
+            total_pruned += trie.prune(1);
+        }
+
+        assert!(total_pruned > 0, "should have pruned some nodes");
         assert_eq!(root_before, trie.root(), "root hash should be preserved");
 
         for key in &keys {
