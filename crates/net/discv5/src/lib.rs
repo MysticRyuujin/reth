@@ -503,8 +503,18 @@ pub fn build_local_enr(
             }
             builder.udp6(addr.port());
         }
-        // Advertise tcp4 when v4 is configured, else tcp6.
-        if v4.is_some() {
+        // Advertise the RLPx TCP port on one family (v4 preferred), since a node has a single
+        // RLPx port. The exception is a `tcp=0` "no RLPx" signal (e.g. a discovery-only
+        // bootnode): advertise it on every configured family so peers of either family see it
+        // and skip the dial. Real nodes always have a nonzero port, so they are unaffected.
+        if tcp_socket.port() == 0 {
+            if v4.is_some() {
+                builder.tcp4(0);
+            }
+            if v6.is_some() {
+                builder.tcp6(0);
+            }
+        } else if v4.is_some() {
             builder.tcp4(tcp_socket.port());
         } else if v6.is_some() {
             builder.tcp6(tcp_socket.port());
@@ -1015,6 +1025,28 @@ mod test {
 
         assert_eq!(fork_id, decoded_fork_id);
         assert_eq!(TCP_PORT, enr.tcp4().unwrap()); // listen config is defaulting to ip mode ipv4
+    }
+
+    #[test]
+    fn build_enr_tcp_zero_advertised_on_every_family() {
+        // A `tcp=0` "no RLPx" signal (e.g. a discovery-only bootnode) must be advertised on both
+        // families of a dual-stack ENR, otherwise peers of the un-signalled family fall back to
+        // the udp port and attempt a doomed RLPx dial.
+        let listen = ListenConfig::DualStack {
+            ipv4: Ipv4Addr::UNSPECIFIED,
+            ipv4_port: 30303,
+            ipv6: Ipv6Addr::UNSPECIFIED,
+            ipv6_port: 30303,
+        };
+        let config = Config::builder((Ipv4Addr::UNSPECIFIED, 0).into())
+            .discv5_config(discv5::ConfigBuilder::new(listen).build())
+            .build();
+
+        let sk = SecretKey::new(&mut thread_rng());
+        let (enr, _, _, _) = build_local_enr(&sk, &config);
+
+        assert_eq!(enr.tcp4(), Some(0));
+        assert_eq!(enr.tcp6(), Some(0));
     }
 
     #[test]
